@@ -1,7 +1,9 @@
 import torch
 from torch import nn
 import numpy as np
+import math
 import torch.nn.init as init
+import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -191,3 +193,124 @@ class contrastive_loss(nn.Module):
                                       (target) * torch.clamp(self.margin - euclidean_distance, min=0.0))
 
         return loss_contrastive / self.temperature
+
+    
+# Geometric layers
+# ------------------------
+
+class Rotation(nn.Module):
+
+    __constants__ = ['in_features']
+
+    def __init__(self, in_features):
+        super().__init__()
+
+        self.p = nn.Parameter(torch.Tensor(in_features, 2).to(device), requires_grad=True)
+        self.theta = nn.Parameter(torch.Tensor(1, 1).to(device), requires_grad=True)
+        self.I = torch.eye(in_features).to(device)
+        self.i = torch.eye(2).to(device)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.theta, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.p, a=math.sqrt(5))
+
+    def forward(self, input):
+        p = torch.softmax(self.p, 0)
+        R = torch.Tensor([[torch.cos(self.theta), -torch.sin(self.theta)], \
+                          [torch.sin(self.theta), torch.cos(self.theta)]]).to(device)
+
+        R = self.I + torch.matmul(torch.matmul(p, (R - self.i)), p.transpose(0, 1))
+        return F.linear(input, R)
+
+    def extra_repr(self):
+        return 'in_features={}'.format(
+            self.in_features is not None
+            )
+
+
+class Scaling(nn.Module):
+
+    __constants__ = ['in_features']
+
+    def __init__(self, in_features):
+        super().__init__()
+
+        self.param = nn.Parameter(torch.Tensor(in_features).to(device), requires_grad=True)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.uniform_(self.param)
+
+    def forward(self, input):
+        weights = torch.diag(self.param)
+        return F.linear(input, weights)
+
+    def extra_repr(self):
+        return 'in_features={}'.format(
+            self.in_features is not None
+            )
+
+
+class TransProj(nn.Module):
+
+    __constants__ = ['in_features']
+
+    def __init__(self, in_features):
+        super().__init__()
+
+        self.in_features = in_features
+        self.transl = nn.Parameter(torch.Tensor(in_features).to(device), requires_grad=True)
+        self.proj = nn.Parameter(torch.Tensor(in_features).to(device), requires_grad=True)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.uniform_(self.transl, a=0, b=0)
+        nn.init.uniform_(self.proj, a=0, b=0)
+
+    def forward(self, input):
+        input = torch.cat((input, torch.ones(input.shape[0], 1).to(device)), -1)
+        weights = torch.eye(self.in_features + 1).to(device)
+        weights[:-1, -1] =  self.transl
+        weights[-1, :-1] = self.proj
+
+        return F.linear(input, weights)[:, :-1]
+
+    def extra_repr(self):
+        return 'in_features={}'.format(
+            self.in_features is not None
+            )
+
+
+class Shear(nn.Module):
+
+    __constants__ = ['in_features']
+
+    def __init__(self, in_features):
+        super().__init__()
+
+        self.in_features = in_features
+        self.shear_top = nn.Parameter(torch.Tensor(in_features-1).to(device), requires_grad=True)
+        self.shear_down = nn.Parameter(torch.Tensor(in_features-1).to(device), requires_grad=True)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.uniform_(self.shear_top)
+        nn.init.uniform_(self.shear_down)
+
+    def forward(self, input):
+        I = torch.eye(self.in_features).to(device)
+        shear_top = torch.diag(self.shear_top, 1)
+        shear_down = torch.diag(self.shear_down, -1)
+        weights  = I + shear_down + shear_top
+
+        return F.linear(input, weights)
+
+    def extra_repr(self):
+        return 'in_features={}'.format(
+            self.in_features is not None
+            )
+
+# ------------------------
